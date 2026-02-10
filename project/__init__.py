@@ -1,2 +1,0 @@
-"""CausalGaitFM project package."""
-
