@@ -1,6 +1,6 @@
 from .backbone import MambaBlockWrapper, SimpleSelectiveSSMBlock, TemporalEncoder, TemporalEncoderConfig
 from .causal_gait import CausalGaitFM
-from .heads import MultiTaskHeads
+from .heads import MultiTaskHeads, OrdinalHead
 from .scm import SCM_Layer, SCMEncoder, dag_acyclicity_loss, hsic_independence_loss
 
 __all__ = [
@@ -13,5 +13,6 @@ __all__ = [
     "dag_acyclicity_loss",
     "hsic_independence_loss",
     "MultiTaskHeads",
+    "OrdinalHead",
     "CausalGaitFM",
 ]

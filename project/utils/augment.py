@@ -1,3 +1,12 @@
+"""Counterfactual augmentation utilities (legacy placeholders).
+
+.. note::
+    The main model in ``project.model.CausalGaitModel`` has a built-in
+    ``generate_counterfactuals()`` method that produces proper counterfactual
+    signals using the learned SCM + GaitDecoder. These utility functions remain
+    available for simple ablation/testing but are NOT used in the main pipeline.
+"""
+
 from __future__ import annotations
 
 import torch

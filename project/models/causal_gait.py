@@ -1,5 +1,13 @@
+"""Deprecated: Use ``project.model.CausalGaitModel`` instead.
+
+This module contains an early integration scaffold that is superseded by the
+full model in ``project/model.py`` which includes the GaitDecoder, IRM support,
+counterfactual generation, and reconstruction loss.
+"""
+
 from __future__ import annotations
 
+import warnings
 from typing import Literal, Sequence
 
 from torch import Tensor, nn
@@ -10,9 +18,23 @@ from .scm import SCMEncoder
 
 
 class CausalGaitFM(nn.Module):
-    """Integration scaffold: backbone + SCM + multi-task heads."""
+    """**Deprecated** integration scaffold: backbone + SCM + multi-task heads.
 
-    def __init__(
+    .. deprecated::
+        Use :class:`project.model.CausalGaitModel` for the full model that
+        includes reconstruction, counterfactual generation, and IRM support.
+    """
+
+    def __init__(self, *args, **kwargs):
+        warnings.warn(
+            "CausalGaitFM is deprecated. Use project.model.CausalGaitModel instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__()
+        self._init_impl(*args, **kwargs)
+
+    def _init_impl(
         self,
         input_dim: int,
         d_model: int = 128,
@@ -28,8 +50,6 @@ class CausalGaitFM(nn.Module):
         num_frailty_classes: int = 5,
         num_disease_classes: int = 4,
     ) -> None:
-        super().__init__()
-
         backbone_cfg = TemporalEncoderConfig(
             input_dim=input_dim,
             d_model=d_model,
