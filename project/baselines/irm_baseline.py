@@ -12,10 +12,7 @@ from torch import Tensor, nn
 
 from .backbone_shared import SharedBackbone
 
-try:
-    from project.utils.losses import irm_penalty
-except ModuleNotFoundError:
-    from utils.losses import irm_penalty
+from project.utils.losses import irm_penalty
 
 
 class IRMBaselineModel(nn.Module):

@@ -25,56 +25,92 @@ import sys
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-try:
-    from project.train import TrainConfig, train, set_seed
-    from project.baselines.erm import ERMModel
-    from project.baselines.dann import DANNModel
-    from project.baselines.coral import CORALModel
-    from project.baselines.irm_baseline import IRMBaselineModel
-    from project.baselines.groupdro import GroupDROModel
-    from project.baselines.miro import MIROModel
-    from project.baselines.domainbed import DomainBedModel
-    from project.baselines.cnn_lstm import CNNLSTMModel
-    from project.baselines.transformer import TransformerModel
-    from project.baselines.beta_vae import BetaVAE
-    from project.baselines.causal_vae import CausalVAE
-    from project.baselines.st_gcn import STGCNModel
-    from project.data.dataset import load_processed_datasets, create_dataloaders
-    from project.utils.metrics import calculate_metrics
-except ModuleNotFoundError:
-    from train import TrainConfig, train, set_seed
-    from baselines.erm import ERMModel
-    from baselines.dann import DANNModel
-    from baselines.coral import CORALModel
-    from baselines.irm_baseline import IRMBaselineModel
-    from baselines.groupdro import GroupDROModel
-    from baselines.miro import MIROModel
-    from baselines.domainbed import DomainBedModel
-    from baselines.cnn_lstm import CNNLSTMModel
-    from baselines.transformer import TransformerModel
-    from baselines.beta_vae import BetaVAE
-    from baselines.causal_vae import CausalVAE
-    from baselines.st_gcn import STGCNModel
-    from data.dataset import load_processed_datasets, create_dataloaders
-    from utils.metrics import calculate_metrics
+from project.train import TrainConfig, train, set_seed
+from project.baselines.erm import ERMModel
+from project.baselines.dann import DANNModel
+from project.baselines.coral import CORALModel
+from project.baselines.irm_baseline import IRMBaselineModel
+from project.baselines.groupdro import GroupDROModel
+from project.baselines.miro import MIROModel
+from project.baselines.domainbed import DomainBedModel
+from project.baselines.cnn_lstm import CNNLSTMModel
+from project.baselines.transformer import TransformerModel
+from project.baselines.beta_vae import BetaVAE
+from project.baselines.causal_vae import CausalVAE
+from project.baselines.st_gcn import STGCNModel
+from project.data.dataset import load_processed_datasets, create_dataloaders
+from project.utils.metrics import calculate_metrics
+
+
+def _stop_file(base_cfg: TrainConfig) -> Path:
+    return Path(base_cfg.control_dir) / f"{base_cfg.run_id}.stop"
+
+
+def _stop_requested(base_cfg: TrainConfig) -> bool:
+    return _stop_file(base_cfg).exists()
+
+
+def _str2bool(value: str | bool | None) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    text = value.strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(
+    progress_cb: ProgressCallback | None,
+    stage_name: str,
+    event: str,
+    sub_done: int,
+    sub_total: int,
+    sub_name: str = "",
+) -> None:
+    if progress_cb is None:
+        return
+    progress_cb(
+        {
+            "stage_name": stage_name,
+            "event": event,
+            "sub_done": int(sub_done),
+            "sub_total": int(sub_total),
+            "sub_name": sub_name,
+        }
+    )
 
 
 # ============================================================================
 # Experiment: CausalGaitFM Cross-Domain (paper Table 2, last row)
 # ============================================================================
 
-def run_cross_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
+def run_cross_domain(
+    base_cfg: TrainConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, dict[str, float]]:
     """Train on 5 source domains, test on each held-out target domain."""
     all_domains = base_cfg.dataset_names
+    total = len(all_domains)
     results = {}
+    _emit_progress(progress_cb, "cross_domain", "start", 0, total, "")
 
     for target in all_domains:
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; terminating cross-domain loop.")
+            break
+
         print(f"\n{'='*60}")
         print(f"Cross-domain: target={target}")
         print(f"{'='*60}")
@@ -86,6 +122,10 @@ def run_cross_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 
         metrics = train(cfg)
         results[target] = metrics
+        _emit_progress(progress_cb, "cross_domain", "step_done", len(results), total, target)
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; cross-domain loop ended after current target.")
+            break
 
     # Summary
     print(f"\n{'='*60}")
@@ -94,8 +134,12 @@ def run_cross_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
         acc = m.get("disease_acc", 0) * 100
         print(f"  {target}: disease_acc={acc:.1f}%")
 
-    avg_acc = np.mean([m.get("disease_acc", 0) for m in results.values()]) * 100
-    print(f"  Average: {avg_acc:.1f}%")
+    if results:
+        avg_acc = np.mean([m.get("disease_acc", 0) for m in results.values()]) * 100
+        print(f"  Average: {avg_acc:.1f}%")
+    else:
+        print("  No completed targets.")
+    _emit_progress(progress_cb, "cross_domain", "done", len(results), total, "")
     _save_results(results, Path(base_cfg.output_dir) / "cross_domain" / "results.json")
     return results
 
@@ -133,11 +177,20 @@ ABLATION_CONFIGS = {
 }
 
 
-def run_ablation(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
+def run_ablation(
+    base_cfg: TrainConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, dict[str, float]]:
     """Progressive ablation study (paper Section 2.5, Figure 2)."""
     results = {}
+    total = len(ABLATION_CONFIGS)
+    _emit_progress(progress_cb, "ablation", "start", 0, total, "")
 
     for ablation_name, toggles in ABLATION_CONFIGS.items():
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; terminating ablation loop.")
+            break
+
         print(f"\n{'='*60}")
         print(f"Ablation: {ablation_name}")
         print(f"  Toggles: {toggles}")
@@ -150,15 +203,25 @@ def run_ablation(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 
         metrics = train(cfg)
         results[ablation_name] = metrics
+        _emit_progress(progress_cb, "ablation", "step_done", len(results), total, ablation_name)
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; ablation loop ended after current config.")
+            break
 
     # Summary
     print(f"\n{'='*60}")
     print("Ablation results summary:")
+    if not results:
+        print("  No completed ablation configs.")
+        _emit_progress(progress_cb, "ablation", "done", 0, total, "")
+        _save_results(results, Path(base_cfg.output_dir) / "ablation" / "results.json")
+        return results
     for name, m in results.items():
         acc = m.get("disease_acc", 0) * 100
         f1 = m.get("disease_macro_f1", 0)
         print(f"  {name}: acc={acc:.1f}%, f1={f1:.4f}")
 
+    _emit_progress(progress_cb, "ablation", "done", len(results), total, "")
     _save_results(results, Path(base_cfg.output_dir) / "ablation" / "results.json")
     return results
 
@@ -191,7 +254,10 @@ def _train_baseline(
 
         for batch in train_loader:
             global_iter += 1
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {
+                k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
             loss_dict = model.compute_loss(
                 x=batch["x"],
                 targets=batch[label_key],
@@ -213,7 +279,10 @@ def _train_baseline(
         all_preds, all_targets = [], []
         with torch.no_grad():
             for batch in val_loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 if hasattr(model, 'backbone'):
                     logits = model(batch["x"], lengths=batch.get("lengths"))
                     if isinstance(logits, tuple):
@@ -237,7 +306,10 @@ def _train_baseline(
     return {"accuracy": best_acc}
 
 
-def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
+def run_baselines(
+    base_cfg: TrainConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, dict[str, float]]:
     """Run all baseline models for comparison."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(42)
@@ -254,6 +326,10 @@ def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
         loaders = create_dataloaders(
             datasets=datasets, mode="cross_domain",
             target_domain=target, batch_size=base_cfg.batch_size,
+            num_workers=base_cfg.num_workers,
+            pin_memory=base_cfg.pin_memory,
+            persistent_workers=base_cfg.persistent_workers,
+            prefetch_factor=base_cfg.prefetch_factor,
         )
         train_loader, val_loader = loaders["train"], loaders["val"]
     else:
@@ -262,6 +338,7 @@ def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 
     if train_loader is None:
         print("[WARN] No data for baselines. Skipping.")
+        _emit_progress(progress_cb, "baselines", "done", 0, 0, "")
         return results
 
     baseline_configs = {
@@ -278,8 +355,14 @@ def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
         "CausalVAE": (CausalVAE, {"input_dim": base_cfg.input_dim, "num_classes": base_cfg.num_disease_classes}),
         "ST-GCN": (STGCNModel, {"input_dim": base_cfg.input_dim, "num_classes": base_cfg.num_disease_classes}),
     }
+    total = len(baseline_configs)
+    _emit_progress(progress_cb, "baselines", "start", 0, total, "")
 
     for name, (cls, kwargs) in baseline_configs.items():
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; terminating baselines loop.")
+            break
+
         print(f"\n{'='*60}")
         print(f"Baseline: {name} (target={target})")
         print(f"{'='*60}")
@@ -289,8 +372,13 @@ def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
             num_epochs=base_cfg.num_epochs, lr=base_cfg.lr, device=device,
         )
         results[name] = metrics
+        _emit_progress(progress_cb, "baselines", "step_done", len(results), total, name)
         print(f"  -> {name}: accuracy={metrics['accuracy']*100:.1f}%")
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; baselines loop ended after current model.")
+            break
 
+    _emit_progress(progress_cb, "baselines", "done", len(results), total, "")
     _save_results(results, Path(base_cfg.output_dir) / "baselines" / "results.json")
     return results
 
@@ -299,11 +387,20 @@ def run_baselines(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 # Experiment: In-Domain 5-Fold CV (paper Table 3)
 # ============================================================================
 
-def run_in_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
+def run_in_domain(
+    base_cfg: TrainConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, dict[str, float]]:
     """In-domain 5-fold cross-validation."""
     results = {}
+    total = int(base_cfg.n_folds)
+    _emit_progress(progress_cb, "in_domain", "start", 0, total, "")
 
     for fold in range(base_cfg.n_folds):
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; terminating in-domain loop.")
+            break
+
         print(f"\n{'='*60}")
         print(f"In-domain: fold {fold+1}/{base_cfg.n_folds}")
         print(f"{'='*60}")
@@ -315,8 +412,16 @@ def run_in_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 
         metrics = train(cfg)
         results[f"fold_{fold}"] = metrics
+        _emit_progress(progress_cb, "in_domain", "step_done", len(results), total, f"fold_{fold}")
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; in-domain loop ended after current fold.")
+            break
 
     # Average metrics
+    if not results:
+        _emit_progress(progress_cb, "in_domain", "done", 0, total, "")
+        _save_results(results, Path(base_cfg.output_dir) / "in_domain" / "results.json")
+        return results
     all_metrics = list(results.values())
     avg = {}
     for key in all_metrics[0]:
@@ -329,6 +434,8 @@ def run_in_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
         acc = m.get("disease_acc", 0) * 100
         print(f"  {fold_name}: disease_acc={acc:.1f}%")
 
+    # Exclude "average" from progress done counter.
+    _emit_progress(progress_cb, "in_domain", "done", len(results) - 1, total, "")
     _save_results(results, Path(base_cfg.output_dir) / "in_domain" / "results.json")
     return results
 
@@ -337,13 +444,19 @@ def run_in_domain(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
 # Experiment: Single-Task vs Multi-Task (paper Table 4)
 # ============================================================================
 
-def run_single_task(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
+def run_single_task(
+    base_cfg: TrainConfig,
+    progress_cb: ProgressCallback | None = None,
+) -> dict[str, dict[str, float]]:
     """Compare single-task training vs multi-task training (paper Table 4).
 
     Trains the model separately for each task (disease, fall, frailty)
     and compares with the full multi-task model.
     """
     results = {}
+    total = 4
+    done = 0
+    _emit_progress(progress_cb, "single_task", "start", 0, total, "")
 
     # Multi-task (baseline comparison)
     print(f"\n{'='*60}")
@@ -353,9 +466,20 @@ def run_single_task(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
     cfg_mt.single_task = None
     cfg_mt.output_dir = f"{base_cfg.output_dir}/single_task/multi_task"
     results["multi_task"] = train(cfg_mt)
+    done += 1
+    _emit_progress(progress_cb, "single_task", "step_done", done, total, "multi_task")
+    if _stop_requested(base_cfg):
+        print("[control] stop requested; single-task loop ended after multi-task run.")
+        _emit_progress(progress_cb, "single_task", "done", done, total, "")
+        _save_results(results, Path(base_cfg.output_dir) / "single_task" / "results.json")
+        return results
 
     # Single tasks
     for task in ("disease", "fall", "frailty"):
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; terminating single-task loop.")
+            break
+
         print(f"\n{'='*60}")
         print(f"Single-task experiment: {task} only")
         print(f"{'='*60}")
@@ -363,6 +487,11 @@ def run_single_task(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
         cfg_st.single_task = task
         cfg_st.output_dir = f"{base_cfg.output_dir}/single_task/{task}"
         results[task] = train(cfg_st)
+        done += 1
+        _emit_progress(progress_cb, "single_task", "step_done", done, total, task)
+        if _stop_requested(base_cfg):
+            print("[control] stop requested; single-task loop ended after current task.")
+            break
 
     # Summary
     print(f"\n{'='*60}")
@@ -377,6 +506,7 @@ def run_single_task(base_cfg: TrainConfig) -> dict[str, dict[str, float]]:
             f"frailty_mae={frailty_mae:.3f} frailty_OA={frailty_oa:.1f}%"
         )
 
+    _emit_progress(progress_cb, "single_task", "done", done, total, "")
     _save_results(results, Path(base_cfg.output_dir) / "single_task" / "results.json")
     return results
 
@@ -427,6 +557,26 @@ def main():
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--use-dummy-data", action="store_true")
     parser.add_argument("--early-stop-patience", type=int, default=15)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--device", default="auto", help="Training device: auto|cuda|cpu")
+
+    parser.add_argument("--pin-memory", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--persistent-workers", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+
+    parser.add_argument("--auto-batch", action="store_true")
+    parser.add_argument("--min-batch-size", type=int, default=4)
+
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--run-id", default="default")
+    parser.add_argument("--control-dir", default="outputs/control")
+    parser.add_argument("--check-stop-every", type=int, default=20)
+    parser.add_argument("--save-every-steps", type=int, default=200)
+
+    parser.add_argument("--use-amp", type=_str2bool, nargs="?", const=True, default=None)
+    parser.add_argument("--amp-dtype", default="fp16", choices=["fp16", "bf16"])
+    parser.add_argument("--allow-tf32", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--cudnn-benchmark", type=_str2bool, nargs="?", const=True, default=True)
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -439,6 +589,22 @@ def main():
         output_dir=args.output_dir,
         use_dummy_data=args.use_dummy_data,
         early_stop_patience=args.early_stop_patience,
+        num_workers=args.num_workers,
+        device=args.device,
+        pin_memory=bool(args.pin_memory),
+        persistent_workers=bool(args.persistent_workers),
+        prefetch_factor=args.prefetch_factor,
+        auto_batch=args.auto_batch,
+        min_batch_size=args.min_batch_size,
+        resume_from=args.resume_from,
+        run_id=args.run_id,
+        control_dir=args.control_dir,
+        check_stop_every=args.check_stop_every,
+        save_every_steps=args.save_every_steps,
+        use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        allow_tf32=bool(args.allow_tf32),
+        cudnn_benchmark=bool(args.cudnn_benchmark),
     )
 
     experiments = {

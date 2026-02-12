@@ -11,10 +11,7 @@ from typing import Literal, Sequence
 import torch
 from torch import Tensor, nn
 
-try:
-    from project.models.backbone import TemporalEncoder, TemporalEncoderConfig
-except ModuleNotFoundError:
-    from models.backbone import TemporalEncoder, TemporalEncoderConfig
+from project.models.backbone import TemporalEncoder, TemporalEncoderConfig
 
 
 class SharedBackbone(nn.Module):

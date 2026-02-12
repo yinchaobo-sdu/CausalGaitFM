@@ -26,16 +26,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-try:
-    from project.model import CausalGaitModel
-    from project.baselines.transformer import TransformerModel
-    from project.baselines.cnn_lstm import CNNLSTMModel
-    from project.baselines.backbone_shared import SharedBackbone
-except ModuleNotFoundError:
-    from model import CausalGaitModel
-    from baselines.transformer import TransformerModel
-    from baselines.cnn_lstm import CNNLSTMModel
-    from baselines.backbone_shared import SharedBackbone
+from project.model import CausalGaitModel
+from project.baselines.transformer import TransformerModel
+from project.baselines.cnn_lstm import CNNLSTMModel
+from project.baselines.backbone_shared import SharedBackbone
 
 
 # ---------------------------------------------------------------------------

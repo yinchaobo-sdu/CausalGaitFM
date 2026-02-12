@@ -6,14 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-try:
-    from project.models.backbone import MambaBlockWrapper, TemporalEncoder, TemporalEncoderConfig
-    from project.models.heads import MultiTaskHeads
-    from project.models.scm import SCM_Layer
-except ModuleNotFoundError:
-    from models.backbone import MambaBlockWrapper, TemporalEncoder, TemporalEncoderConfig
-    from models.heads import MultiTaskHeads
-    from models.scm import SCM_Layer
+from project.models.backbone import MambaBlockWrapper, TemporalEncoder, TemporalEncoderConfig
+from project.models.heads import MultiTaskHeads
+from project.models.scm import SCM_Layer
 
 
 class DecoderSSMLayer(nn.Module):
@@ -148,12 +143,14 @@ class CausalGaitModel(nn.Module):
         num_frailty_classes: int = 5,
         decoder_n_layers: int = 2,
         decoder_layer_type: Literal["mamba", "lstm"] = "mamba",
+        use_scm: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.seq_len = seq_len
         self.causal_dim = causal_dim
         self.domain_dim = domain_dim
+        self.use_scm = use_scm
 
         backbone_cfg = TemporalEncoderConfig(
             input_dim=input_dim,
@@ -166,11 +163,24 @@ class CausalGaitModel(nn.Module):
             dropout=dropout,
         )
         self.backbone = TemporalEncoder(config=backbone_cfg)
-        self.scm = SCM_Layer(
-            input_dim=d_model,
-            causal_dim=causal_dim,
-            domain_dim=domain_dim,
-        )
+        if self.use_scm:
+            self.scm = SCM_Layer(
+                input_dim=d_model,
+                causal_dim=causal_dim,
+                domain_dim=domain_dim,
+            )
+            self.no_scm_causal_proj = None
+            self.no_scm_domain_proj = None
+        else:
+            self.scm = None
+            self.no_scm_causal_proj = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, causal_dim),
+            )
+            self.no_scm_domain_proj = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, domain_dim),
+            )
         self.heads = MultiTaskHeads(
             input_dim=causal_dim,
             num_disease_classes=num_disease_classes,
@@ -188,6 +198,34 @@ class CausalGaitModel(nn.Module):
             dropout=dropout,
             temporal_layer_type=decoder_layer_type,
         )
+
+    def _forward_without_scm(
+        self,
+        pooled: Tensor,
+        sample_domain: bool,
+    ) -> dict[str, Tensor]:
+        if self.no_scm_causal_proj is None or self.no_scm_domain_proj is None:
+            raise RuntimeError("No-SCM projections are not initialized.")
+
+        z_c = self.no_scm_causal_proj(pooled)
+        z_d_mu = self.no_scm_domain_proj(pooled)
+        if sample_domain:
+            z_d = z_d_mu + 0.01 * torch.randn_like(z_d_mu)
+        else:
+            z_d = z_d_mu
+
+        adjacency = pooled.new_zeros((self.causal_dim, self.causal_dim))
+        zero = pooled.new_tensor(0.0)
+        return {
+            "z_c": z_c,
+            "z_d": z_d,
+            "z_d_mu": z_d_mu,
+            "z_d_logvar": torch.zeros_like(z_d_mu),
+            "adjacency": adjacency,
+            "dag_loss": zero,
+            "hsic_loss": zero,
+            "domain_kl_loss": zero,
+        }
 
     @staticmethod
     def _sample_domain_shuffle_indices(batch_domain_ids: Tensor) -> Tensor:
@@ -250,7 +288,15 @@ class CausalGaitModel(nn.Module):
             raise ValueError(f"CausalGaitModel expects [B,T,D] or [T,D], got {tuple(x.shape)}")
 
         backbone_out = self.backbone(x, lengths=lengths, return_dict=True)
-        scm_out = self.scm(backbone_out["sequence"], sample_domain=sample_domain)
+        if self.use_scm:
+            if self.scm is None:
+                raise RuntimeError("SCM module is not initialized.")
+            scm_out = self.scm(backbone_out["sequence"], sample_domain=sample_domain)
+        else:
+            scm_out = self._forward_without_scm(
+                pooled=backbone_out["pooled"],
+                sample_domain=sample_domain,
+            )
         head_out = self.heads(scm_out["z_c"])
 
         recon = self.decode_from_latent(
@@ -268,4 +314,3 @@ class CausalGaitModel(nn.Module):
 
 
 __all__ = ["GaitDecoder", "CausalGaitModel"]
-

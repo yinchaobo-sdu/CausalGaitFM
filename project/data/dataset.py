@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -315,6 +316,9 @@ def create_dataloaders(
     n_folds: int = 5,
     batch_size: int = 64,
     num_workers: int = 0,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
     seed: int = 42,
 ) -> dict[str, DataLoader]:
     """Create train/val DataLoaders according to the evaluation protocol.
@@ -369,21 +373,46 @@ def create_dataloaders(
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        drop_last=True,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
-        pin_memory=True,
-    )
+    effective_num_workers = max(0, int(num_workers))
+    allow_windows_workers = os.environ.get("CGF_ALLOW_WINDOWS_WORKERS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if os.name == "nt" and effective_num_workers > 0 and not allow_windows_workers:
+        # Windows + multiprocessing workers can hard-abort under some Intel runtime stacks.
+        # Default to a stable single-process loader; users can opt in via env override.
+        print(
+            "[warn] Windows stability mode: forcing num_workers=0 "
+            "(set CGF_ALLOW_WINDOWS_WORKERS=1 to keep multiprocessing workers)."
+        )
+        effective_num_workers = 0
+
+    effective_persistent_workers = bool(persistent_workers) and effective_num_workers > 0
+    effective_prefetch_factor = max(2, int(prefetch_factor))
+
+    train_loader_kwargs = {
+        "dataset": train_ds,
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": effective_num_workers,
+        "drop_last": True,
+        "pin_memory": pin_memory,
+    }
+    val_loader_kwargs = {
+        "dataset": val_ds,
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": effective_num_workers,
+        "drop_last": False,
+        "pin_memory": pin_memory,
+    }
+
+    if effective_num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = effective_persistent_workers
+        val_loader_kwargs["persistent_workers"] = effective_persistent_workers
+        train_loader_kwargs["prefetch_factor"] = effective_prefetch_factor
+        val_loader_kwargs["prefetch_factor"] = effective_prefetch_factor
+
+    train_loader = DataLoader(**train_loader_kwargs)
+    val_loader = DataLoader(**val_loader_kwargs)
 
     return {"train": train_loader, "val": val_loader}

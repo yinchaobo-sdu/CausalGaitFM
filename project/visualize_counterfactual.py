@@ -20,12 +20,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-try:
-    from project.model import CausalGaitModel
-    from project.train import TrainConfig, make_dummy_batch, set_seed
-except ModuleNotFoundError:
-    from model import CausalGaitModel
-    from train import TrainConfig, make_dummy_batch, set_seed
+from project.model import CausalGaitModel
+from project.train import TrainConfig, make_dummy_batch, set_seed
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +230,7 @@ def main():
     ).to(device)
 
     if args.checkpoint and Path(args.checkpoint).exists():
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"Loaded checkpoint from {args.checkpoint}")
     else:

@@ -64,6 +64,110 @@ pip install -r project/requirements.txt
 pip install mamba-ssm>=2.2
 ```
 
+## Local RTX 4060 One-Command Pipeline (Windows)
+
+The repository now includes an end-to-end pipeline entrypoint:
+
+```bash
+python -m project.pipeline --profile local_4060_full --device cuda --auto-batch
+```
+
+Recommended local setup (single 4060):
+
+```bash
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\python -m pip install torch==2.10.0+cu128 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+.venv\Scripts\python -m pip install -e .
+.venv\Scripts\python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+.venv\Scripts\python -m project.pipeline --profile local_4060_full --device cuda --auto-batch
+```
+
+Pipeline steps:
+1. environment check
+2. dataset download
+3. dataset preprocess
+4. smoke training
+5. full experiments
+6. benchmark
+7. paper tables/figures generation
+
+Expected outputs:
+- `outputs/cross_domain/results.json`
+- `outputs/ablation/results.json`
+- `outputs/baselines/results.json`
+- `outputs/in_domain/results.json`
+- `outputs/single_task/results.json`
+- `outputs/benchmark/benchmark_results.json`
+- `outputs/paper/all_tables.md`
+- `outputs/paper/figure2a_ablation.png`
+- `outputs/paper/figure2d_efficiency.png`
+
+Typical runtime on a single RTX 4060 (fallback backend): around 12-30 hours for full pipeline.
+
+## One-Click Start / Stop / Resume (Windows PowerShell)
+
+Start training in background:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_train.ps1 -RunId r4060_train
+```
+
+Graceful stop (writes `outputs/control/<run_id>.stop`, waits for safe checkpoint save):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/stop_run.ps1 -RunId r4060_train
+```
+
+Resume training from `outputs/<run_id>/last_model.pth`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/resume_train.ps1 -RunId r4060_train
+```
+
+Start full pipeline in background:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_pipeline.ps1 -RunId r4060_full
+```
+
+Resume pipeline from `outputs/<run_id>/pipeline_state.json`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/resume_pipeline.ps1 -RunId r4060_full
+```
+
+Watch pipeline progress in real time (stage + substage + ETA):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/watch_pipeline.ps1 -RunId r4060_full
+```
+
+Watch progress with recent log tail:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/watch_pipeline.ps1 -RunId r4060_full -ShowLog -LogLines 30
+```
+
+`pipeline_state.json` now includes:
+
+- `progress_percent`
+- `stages_total` / `stages_completed`
+- `current_stage`
+- `current_substage`
+- `eta_seconds`
+- `started_at`
+- `last_error`
+
+Default optimization profile applied by scripts:
+
+- `--device cuda`
+- `--use-amp true --amp-dtype fp16`
+- `--allow-tf32 true --cudnn-benchmark true`
+- `--num-workers 4 --pin-memory true --persistent-workers true --prefetch-factor 4`
+- `--auto-batch --min-batch-size 4`
+- stop/resume controls: `control_dir=outputs/control`, `check_stop_every=20`, `save_every_steps=200`
+
 ## Quick Start
 
 ### 1. Download and Preprocess Data

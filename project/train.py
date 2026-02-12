@@ -11,11 +11,15 @@ Also supports training with synthetic dummy data for quick debugging.
 from __future__ import annotations
 
 import argparse
-import math
+import copy
+import json
 import random
-from dataclasses import dataclass, field
+import signal
+import time
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -23,28 +27,22 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+from project.data.dataset import create_dataloaders, load_processed_datasets
+from project.model import CausalGaitModel
+from project.utils.losses import irm_penalty
+from project.utils.metrics import calculate_metrics
+from project.utils.visualization import visualize_latent_space
+
 try:
-    from project.model import CausalGaitModel
-    from project.utils.losses import irm_penalty
-    from project.utils.metrics import calculate_metrics
-    from project.utils.visualization import visualize_latent_space
-    from project.data.dataset import (
-        GaitDataset,
-        MultiDomainGaitDataset,
-        create_dataloaders,
-        load_processed_datasets,
-    )
-except ModuleNotFoundError:
-    from model import CausalGaitModel
-    from utils.losses import irm_penalty
-    from utils.metrics import calculate_metrics
-    from utils.visualization import visualize_latent_space
-    from data.dataset import (
-        GaitDataset,
-        MultiDomainGaitDataset,
-        create_dataloaders,
-        load_processed_datasets,
-    )
+    from torch.amp import GradScaler as _GradScaler
+    from torch.amp import autocast as _autocast
+
+    _USE_TORCH_AMP = True
+except Exception:
+    from torch.cuda.amp import GradScaler as _GradScaler
+    from torch.cuda.amp import autocast as _autocast
+
+    _USE_TORCH_AMP = False
 
 
 # ============================================================================
@@ -69,13 +67,38 @@ class TrainConfig:
     fold: int = 0
     n_folds: int = 5
 
+    # Runtime / device
+    device: str = "auto"  # auto|cuda|cpu
+
     # Training hyperparams (aligned with paper Sec 4.8)
     batch_size: int = 64
     num_epochs: int = 100
     lr: float = 1e-4
     weight_decay: float = 1e-5
     early_stop_patience: int = 15
-    num_workers: int = 0
+    num_workers: int = 4
+
+    # DataLoader performance knobs
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
+
+    # OOM resiliency
+    auto_batch: bool = False
+    min_batch_size: int = 4
+
+    # Stop / resume control
+    resume_from: str | None = None
+    run_id: str = "default"
+    control_dir: str = "outputs/control"
+    check_stop_every: int = 20
+    save_every_steps: int = 200
+
+    # AMP and CUDA runtime
+    use_amp: bool | None = None  # None => auto (enabled on CUDA)
+    amp_dtype: str = "fp16"  # fp16|bf16
+    allow_tf32: bool = True
+    cudnn_benchmark: bool = True
 
     # Architecture (paper Sec 4.8)
     d_model: int = 128
@@ -135,12 +158,151 @@ class TrainConfig:
 # Helpers
 # ============================================================================
 
+
+@dataclass
+class RuntimeState:
+    amp_enabled: bool
+    amp_dtype: torch.dtype
+    use_scaler: bool
+    scaler: _GradScaler | None
+    amp_fallback_triggered: bool = False
+
+
+@dataclass
+class StopController:
+    run_id: str
+    control_dir: Path
+    stop_requested: bool = False
+    reason: str = ""
+
+    @property
+    def stop_file(self) -> Path:
+        return self.control_dir / f"{self.run_id}.stop"
+
+    def request_stop(self, reason: str) -> None:
+        self.stop_requested = True
+        self.reason = reason
+
+    def poll_stop_file(self) -> bool:
+        if self.stop_requested:
+            return True
+        if self.stop_file.exists():
+            self.request_stop("stop_file")
+            return True
+        return False
+
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _str2bool(value: str | bool | None) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    text = value.strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available.")
+        return torch.device("cuda")
+    if device == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unsupported device: {device}. Use auto|cuda|cpu.")
+
+
+def _is_oom_exception(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error: out of memory" in msg
+
+
+def _configure_cuda_backend(cfg: TrainConfig, device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cuda.matmul.allow_tf32 = bool(cfg.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(cfg.allow_tf32)
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
+
+
+def _resolve_amp_enabled(cfg: TrainConfig, device: torch.device) -> bool:
+    if cfg.use_amp is None:
+        return device.type == "cuda"
+    return bool(cfg.use_amp) and device.type == "cuda"
+
+
+def _resolve_amp_dtype(cfg: TrainConfig, device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    if cfg.amp_dtype == "fp16":
+        return torch.float16
+    if cfg.amp_dtype == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        print("[warn] bf16 requested but unsupported on this GPU. Falling back to fp16.")
+        return torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {cfg.amp_dtype}. Use fp16|bf16.")
+
+
+def _make_grad_scaler(enabled: bool) -> _GradScaler:
+    try:
+        return _GradScaler(device="cuda", enabled=enabled)
+    except TypeError:
+        try:
+            return _GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return _GradScaler(enabled=enabled)
+
+
+def _autocast_context(enabled: bool, dtype: torch.dtype):
+    if not enabled:
+        return nullcontext()
+    if _USE_TORCH_AMP:
+        return _autocast(device_type="cuda", dtype=dtype, enabled=True)
+    return _autocast(enabled=True, dtype=dtype)
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    else:
+        state["cuda"] = None
+    return state
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _to_device_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    return {
+        k: (v.to(device, non_blocking=True) if isinstance(v, Tensor) else v)
+        for k, v in batch.items()
+    }
 
 
 def irm_anneal_weight(iter_idx: int, warmup_iters: int = 500, max_weight: float = 1.0) -> float:
@@ -190,8 +352,7 @@ def _task_ce_losses(
     batch: dict[str, Tensor],
     single_task: str | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    device = batch["label_disease"].device
-    zero = torch.tensor(0.0, device=device)
+    zero = batch["x"].new_tensor(0.0)
 
     if single_task is None or single_task == "disease":
         loss_disease = F.cross_entropy(out["disease_logits"], batch["label_disease"])
@@ -216,63 +377,57 @@ def _task_ce_losses(
 # Train & Validation Steps
 # ============================================================================
 
-def train_step(
+
+def _compute_losses(
     model: CausalGaitModel,
-    optimizer: torch.optim.Optimizer,
     batch: dict[str, Tensor],
     cfg: TrainConfig,
     iter_idx: int,
-) -> dict[str, float]:
-    """Single training step with all loss components (paper Eq. 11)."""
-    model.train()
+) -> tuple[Tensor, dict[str, Tensor]]:
     out = model(batch["x"], lengths=batch.get("lengths"), sample_domain=True)
     loss_disease, loss_fall, loss_frailty = _task_ce_losses(out, batch, single_task=cfg.single_task)
 
-    # Eq. (10): multi-task uncertainty weighting
     if cfg.use_multitask_uncertainty and cfg.single_task is None:
-        loss_mt, loss_mt_parts = model.heads.multi_task_uncertainty_loss(
-            disease_loss=loss_disease, fall_loss=loss_fall, frailty_loss=loss_frailty,
+        loss_mt, _ = model.heads.multi_task_uncertainty_loss(
+            disease_loss=loss_disease,
+            fall_loss=loss_fall,
+            frailty_loss=loss_frailty,
         )
     else:
-        loss_mt = torch.tensor(0.0, device=batch["x"].device)
-        loss_mt_parts = {"mt_disease": loss_mt, "mt_fall": loss_mt, "mt_frailty": loss_mt}
+        loss_mt = batch["x"].new_tensor(0.0)
 
     loss_cls = (loss_disease + loss_fall + loss_frailty) / 3.0
 
-    # IRM penalty (per-domain)
     if cfg.use_irm:
         irm_d = compute_domain_irm_penalty(out["disease_logits"], batch["label_disease"], batch["domain_id"])
         irm_f = compute_domain_irm_penalty(out["fall_logits"], batch["label_fall"], batch["domain_id"])
         irm_r = compute_domain_irm_penalty(out["frailty_logits"], batch["label_frailty"], batch["domain_id"])
         loss_irm = (irm_d + irm_f + irm_r) / 3.0
     else:
-        loss_irm = torch.tensor(0.0, device=batch["x"].device)
+        loss_irm = batch["x"].new_tensor(0.0)
 
-    # Reconstruction loss
     if cfg.use_reconstruction:
         loss_recon = F.mse_loss(out["recon"], out["recon_target"])
     else:
-        loss_recon = torch.tensor(0.0, device=batch["x"].device)
+        loss_recon = batch["x"].new_tensor(0.0)
 
     loss_kl = out["domain_kl_loss"]
     loss_dag = out["dag_loss"]
     loss_hsic = out["hsic_loss"]
 
-    # Counterfactual augmentation
     if cfg.use_counterfactual:
         x_cf, _ = model.generate_counterfactuals(
-            z_c=out["z_c"].detach(), z_d=out["z_d"].detach(),
+            z_c=out["z_c"].detach(),
+            z_d=out["z_d"].detach(),
             batch_domain_ids=batch["domain_id"],
         )
         out_cf = model(x_cf, lengths=batch.get("lengths"), sample_domain=True)
         cf_d, cf_f, cf_r = _task_ce_losses(out_cf, batch)
         loss_cf_cls = (cf_d + cf_f + cf_r) / 3.0
     else:
-        loss_cf_cls = torch.tensor(0.0, device=batch["x"].device)
+        loss_cf_cls = batch["x"].new_tensor(0.0)
 
     beta3_irm = irm_anneal_weight(iter_idx, cfg.irm_warmup_iters) if cfg.use_irm else 0.0
-
-    # Eq. (11): total loss
     total_loss = (
         loss_recon
         + cfg.beta1_kl * loss_kl
@@ -283,26 +438,80 @@ def train_step(
         + cfg.beta6_mt * loss_mt
         + cfg.beta7_cf * loss_cf_cls
     )
+    scalars = {
+        "total_loss": total_loss,
+        "loss_recon": loss_recon,
+        "loss_kl": loss_kl,
+        "loss_cls": loss_cls,
+        "loss_irm": loss_irm,
+        "loss_dag": loss_dag,
+        "loss_hsic": loss_hsic,
+        "loss_mt": loss_mt,
+        "loss_cf_cls": loss_cf_cls,
+        "beta3_irm": total_loss.new_tensor(beta3_irm),
+        "sigma_disease": out["sigma_disease"],
+        "sigma_fall": out["sigma_fall"],
+        "sigma_frailty": out["sigma_frailty"],
+    }
+    return total_loss, scalars
 
+
+def train_step(
+    model: CausalGaitModel,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, Tensor],
+    cfg: TrainConfig,
+    iter_idx: int,
+    runtime: RuntimeState,
+) -> dict[str, float]:
+    """Single training step with all loss components (paper Eq. 11)."""
+    model.train()
     optimizer.zero_grad(set_to_none=True)
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+    amp_this_step = runtime.amp_enabled
+    try:
+        with _autocast_context(enabled=amp_this_step, dtype=runtime.amp_dtype):
+            total_loss, scalars = _compute_losses(model=model, batch=batch, cfg=cfg, iter_idx=iter_idx)
+
+        if runtime.use_scaler and runtime.scaler is not None and amp_this_step:
+            runtime.scaler.scale(total_loss).backward()
+            runtime.scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            runtime.scaler.step(optimizer)
+            runtime.scaler.update()
+        else:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+    except Exception as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        if not amp_this_step:
+            raise
+        runtime.amp_enabled = False
+        runtime.amp_fallback_triggered = True
+        print(f"[warn] AMP step failed ({type(exc).__name__}: {exc}). Falling back to FP32.")
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_context(enabled=False, dtype=runtime.amp_dtype):
+            total_loss, scalars = _compute_losses(model=model, batch=batch, cfg=cfg, iter_idx=iter_idx)
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
     return {
-        "total": float(total_loss.item()),
-        "recon": float(loss_recon.item()),
-        "kl": float(loss_kl.item()),
-        "cls": float(loss_cls.item()),
-        "irm": float(loss_irm.item()),
-        "dag": float(loss_dag.item()),
-        "hsic": float(loss_hsic.item()),
-        "mt": float(loss_mt.item()),
-        "cf_cls": float(loss_cf_cls.item()),
-        "beta3": float(beta3_irm),
-        "sigma_disease": float(out["sigma_disease"].item()),
-        "sigma_fall": float(out["sigma_fall"].item()),
-        "sigma_frailty": float(out["sigma_frailty"].item()),
+        "total": float(scalars["total_loss"].item()),
+        "recon": float(scalars["loss_recon"].item()),
+        "kl": float(scalars["loss_kl"].item()),
+        "cls": float(scalars["loss_cls"].item()),
+        "irm": float(scalars["loss_irm"].item()),
+        "dag": float(scalars["loss_dag"].item()),
+        "hsic": float(scalars["loss_hsic"].item()),
+        "mt": float(scalars["loss_mt"].item()),
+        "cf_cls": float(scalars["loss_cf_cls"].item()),
+        "beta3": float(scalars["beta3_irm"].item()),
+        "sigma_disease": float(scalars["sigma_disease"].item()),
+        "sigma_fall": float(scalars["sigma_fall"].item()),
+        "sigma_frailty": float(scalars["sigma_frailty"].item()),
+        "amp_enabled": float(runtime.amp_enabled),
     }
 
 
@@ -311,24 +520,35 @@ def validation_step(
     model: CausalGaitModel,
     batch: dict[str, Tensor],
     cfg: TrainConfig,
+    runtime: RuntimeState,
 ) -> tuple[dict[str, float], dict[str, Tensor], dict[str, Tensor], dict[str, Tensor]]:
     """Validation step (no parameter update, no IRM)."""
     model.eval()
-    out = model(batch["x"], lengths=batch.get("lengths"), sample_domain=False)
-    loss_disease, loss_fall, loss_frailty = _task_ce_losses(out, batch, single_task=cfg.single_task)
-    loss_mt, _ = model.heads.multi_task_uncertainty_loss(
-        disease_loss=loss_disease, fall_loss=loss_fall, frailty_loss=loss_frailty,
-    )
-    loss_cls = (loss_disease + loss_fall + loss_frailty) / 3.0
-    loss_recon = F.mse_loss(out["recon"], out["recon_target"]) if cfg.use_reconstruction else torch.tensor(0.0)
-    loss_kl = out["domain_kl_loss"]
-    loss_dag = out["dag_loss"]
-    loss_hsic = out["hsic_loss"]
-
-    total_loss = (
-        loss_recon + cfg.beta1_kl * loss_kl + cfg.beta2_cls * loss_cls
-        + cfg.beta4_dag * loss_dag + cfg.beta5_hsic * loss_hsic + cfg.beta6_mt * loss_mt
-    )
+    with _autocast_context(enabled=runtime.amp_enabled, dtype=runtime.amp_dtype):
+        out = model(batch["x"], lengths=batch.get("lengths"), sample_domain=False)
+        loss_disease, loss_fall, loss_frailty = _task_ce_losses(out, batch, single_task=cfg.single_task)
+        loss_mt, _ = model.heads.multi_task_uncertainty_loss(
+            disease_loss=loss_disease,
+            fall_loss=loss_fall,
+            frailty_loss=loss_frailty,
+        )
+        loss_cls = (loss_disease + loss_fall + loss_frailty) / 3.0
+        loss_recon = (
+            F.mse_loss(out["recon"], out["recon_target"])
+            if cfg.use_reconstruction
+            else batch["x"].new_tensor(0.0)
+        )
+        loss_kl = out["domain_kl_loss"]
+        loss_dag = out["dag_loss"]
+        loss_hsic = out["hsic_loss"]
+        total_loss = (
+            loss_recon
+            + cfg.beta1_kl * loss_kl
+            + cfg.beta2_cls * loss_cls
+            + cfg.beta4_dag * loss_dag
+            + cfg.beta5_hsic * loss_hsic
+            + cfg.beta6_mt * loss_mt
+        )
 
     step_metrics = {
         "total": float(total_loss.item()),
@@ -373,6 +593,7 @@ def validate_epoch(
     val_loader: DataLoader | None,
     cfg: TrainConfig,
     device: torch.device,
+    runtime: RuntimeState,
 ) -> tuple[float, dict[str, float], dict[str, Tensor]]:
     """Run full validation epoch."""
     model.eval()
@@ -383,8 +604,8 @@ def validate_epoch(
 
     if val_loader is not None:
         for batch in val_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            step_metrics, y_true, y_pred, latent = validation_step(model, batch, cfg)
+            batch = _to_device_batch(batch, device)
+            step_metrics, y_true, y_pred, latent = validation_step(model, batch, cfg, runtime)
             val_losses.append(step_metrics["total"])
             for key in y_true_store:
                 y_true_store[key].append(y_true[key])
@@ -395,7 +616,7 @@ def validate_epoch(
         # Dummy data mode
         for _ in range(cfg.dummy_val_steps):
             batch = make_dummy_batch(cfg, device)
-            step_metrics, y_true, y_pred, latent = validation_step(model, batch, cfg)
+            step_metrics, y_true, y_pred, latent = validation_step(model, batch, cfg, runtime)
             val_losses.append(step_metrics["total"])
             for key in y_true_store:
                 y_true_store[key].append(y_true[key])
@@ -410,13 +631,75 @@ def validate_epoch(
     return float(np.mean(val_losses)), task_metrics, latent_all
 
 
-def save_checkpoint(state: dict, is_best: bool, filename: str) -> None:
+def _checkpoint_state(
+    cfg: TrainConfig,
+    model: CausalGaitModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    runtime: RuntimeState,
+    epoch: int,
+    global_iter: int,
+    val_loss: float,
+    val_metrics: dict[str, float],
+    best_val_loss: float,
+    best_metrics: dict[str, float],
+    patience_counter: int,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "epoch": epoch,
+        "global_iter": global_iter,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": runtime.scaler.state_dict() if runtime.use_scaler and runtime.scaler is not None else None,
+        "rng_state": _capture_rng_state(),
+        "val_loss": val_loss,
+        "val_metrics": val_metrics,
+        "best_val_loss": best_val_loss,
+        "best_metrics": best_metrics,
+        "patience_counter": patience_counter,
+        "amp_enabled": runtime.amp_enabled,
+        "amp_dtype": cfg.amp_dtype,
+        "reason": reason,
+        "config": asdict(cfg),
+    }
+
+
+def save_checkpoint(state: dict[str, Any], is_best: bool, filename: str) -> None:
     ckpt_path = Path(filename)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, ckpt_path)
     if is_best:
         best_path = ckpt_path.with_name("best_model.pth")
         torch.save(state, best_path)
+
+
+def save_train_state_json(
+    output_dir: Path,
+    run_id: str,
+    epoch: int,
+    global_iter: int,
+    best_val_loss: float,
+    patience_counter: int,
+    status: str,
+    reason: str,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": run_id,
+        "epoch": epoch,
+        "global_iter": global_iter,
+        "best_val_loss": best_val_loss,
+        "patience_counter": patience_counter,
+        "status": status,
+        "reason": reason,
+        "timestamp": int(time.time()),
+    }
+    path = output_dir / "train_state.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    return path
 
 
 def maybe_visualize_epoch(
@@ -454,16 +737,73 @@ def maybe_visualize_epoch(
 # Main training loop
 # ============================================================================
 
-def train(cfg: TrainConfig) -> dict[str, float]:
-    """Full training loop. Returns final validation metrics."""
+def _install_stop_signal_handlers(stop_ctrl: StopController) -> dict[int, Any]:
+    previous: dict[int, Any] = {}
+
+    def _handler(signum, _frame):
+        stop_ctrl.request_stop(f"signal_{signum}")
+        print(f"[control] signal {signum} received; stopping at next safe point.")
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, sig_name):
+            sig = getattr(signal, sig_name)
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handler)
+    return previous
+
+
+def _restore_signal_handlers(previous: dict[int, Any]) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+def _should_stop_now(stop_ctrl: StopController, cfg: TrainConfig, global_iter: int) -> bool:
+    if stop_ctrl.stop_requested:
+        return True
+    if cfg.check_stop_every <= 0:
+        return False
+    if global_iter % cfg.check_stop_every != 0:
+        return False
+    return stop_ctrl.poll_stop_file()
+
+
+def _prepare_stop_controller(cfg: TrainConfig) -> StopController:
+    control_dir = Path(cfg.control_dir)
+    control_dir.mkdir(parents=True, exist_ok=True)
+    stop_ctrl = StopController(run_id=cfg.run_id, control_dir=control_dir)
+    if stop_ctrl.stop_file.exists():
+        print(f"[control] removing stale stop marker: {stop_ctrl.stop_file}")
+        stop_ctrl.stop_file.unlink(missing_ok=True)
+    return stop_ctrl
+
+
+def _train_once(cfg: TrainConfig) -> dict[str, float]:
+    """Single training attempt (without OOM auto-batch retry)."""
     set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device(cfg.device)
+    _configure_cuda_backend(cfg, device)
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    stop_ctrl = _prepare_stop_controller(cfg)
+    previous_signal_handlers = _install_stop_signal_handlers(stop_ctrl)
+
+    amp_enabled = _resolve_amp_enabled(cfg, device)
+    amp_dtype = _resolve_amp_dtype(cfg, device)
+    use_scaler = amp_enabled and device.type == "cuda" and amp_dtype == torch.float16
+    runtime = RuntimeState(
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
+        use_scaler=use_scaler,
+        scaler=_make_grad_scaler(enabled=use_scaler),
+    )
 
     print(f"Device: {device}")
     print(f"Eval mode: {cfg.eval_mode}")
     print(f"Use dummy data: {cfg.use_dummy_data}")
+    print(
+        f"AMP: enabled={runtime.amp_enabled} dtype={cfg.amp_dtype} "
+        f"scaler={runtime.use_scaler}"
+    )
 
     # ----- Data -----
     train_loader: DataLoader | None = None
@@ -490,6 +830,9 @@ def train(cfg: TrainConfig) -> dict[str, float]:
                 n_folds=cfg.n_folds,
                 batch_size=cfg.batch_size,
                 num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                persistent_workers=cfg.persistent_workers,
+                prefetch_factor=cfg.prefetch_factor,
             )
             train_loader = loaders["train"]
             val_loader = loaders["val"]
@@ -513,6 +856,7 @@ def train(cfg: TrainConfig) -> dict[str, float]:
         num_frailty_classes=cfg.num_frailty_classes,
         decoder_n_layers=cfg.decoder_n_layers,
         decoder_layer_type=cfg.decoder_layer_type,
+        use_scm=cfg.use_scm,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -527,93 +871,233 @@ def train(cfg: TrainConfig) -> dict[str, float]:
     patience_counter = 0
     best_metrics: dict[str, float] = {}
 
-    for epoch in range(1, cfg.num_epochs + 1):
-        model.train()
-        epoch_losses: list[float] = []
+    start_epoch = 1
+    if cfg.resume_from:
+        resume_path = Path(cfg.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if ckpt.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if runtime.scaler is not None and runtime.use_scaler and ckpt.get("scaler_state_dict") is not None:
+            runtime.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        _restore_rng_state(ckpt.get("rng_state", {}))
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        global_iter = int(ckpt.get("global_iter", 0))
+        best_val_loss = float(ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf"))))
+        patience_counter = int(ckpt.get("patience_counter", 0))
+        best_metrics = ckpt.get("best_metrics", ckpt.get("val_metrics", {})) or {}
+        print(f"[resume] loaded {resume_path} (start_epoch={start_epoch}, global_iter={global_iter})")
 
-        if cfg.use_dummy_data:
-            # Dummy data loop
-            for _ in range(cfg.dummy_steps_per_epoch):
-                global_iter += 1
+    def _save_last_checkpoint(epoch: int, val_loss: float, val_metrics: dict[str, float], reason: str, is_best: bool) -> None:
+        state = _checkpoint_state(
+            cfg=cfg,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            runtime=runtime,
+            epoch=epoch,
+            global_iter=global_iter,
+            val_loss=val_loss,
+            val_metrics=val_metrics,
+            best_val_loss=best_val_loss,
+            best_metrics=best_metrics,
+            patience_counter=patience_counter,
+            reason=reason,
+        )
+        save_checkpoint(state=state, is_best=is_best, filename=str(output_dir / "last_model.pth"))
+
+    if start_epoch > cfg.num_epochs:
+        print("[resume] checkpoint already beyond requested num_epochs. Skipping training loop.")
+        save_train_state_json(
+            output_dir=output_dir,
+            run_id=cfg.run_id,
+            epoch=start_epoch - 1,
+            global_iter=global_iter,
+            best_val_loss=best_val_loss,
+            patience_counter=patience_counter,
+            status="completed",
+            reason="resume_noop",
+        )
+        _restore_signal_handlers(previous_signal_handlers)
+        return best_metrics
+
+    current_epoch = start_epoch - 1
+    try:
+        for epoch in range(start_epoch, cfg.num_epochs + 1):
+            current_epoch = epoch
+            model.train()
+            epoch_losses: list[float] = []
+            stop_this_epoch = False
+
+            if cfg.use_dummy_data:
+                for _ in range(cfg.dummy_steps_per_epoch):
+                    global_iter += 1
+                    batch = make_dummy_batch(cfg, device)
+                    metrics = train_step(model, optimizer, batch, cfg, global_iter, runtime)
+                    epoch_losses.append(metrics["total"])
+
+                    if global_iter == 1 or global_iter % cfg.log_every == 0:
+                        _log_train_step(global_iter, metrics)
+
+                    if cfg.save_every_steps > 0 and global_iter % cfg.save_every_steps == 0:
+                        _save_last_checkpoint(epoch=epoch, val_loss=float("nan"), val_metrics={}, reason="step_save", is_best=False)
+
+                    if _should_stop_now(stop_ctrl, cfg, global_iter):
+                        stop_this_epoch = True
+                        break
+            else:
+                if train_loader is None:
+                    raise RuntimeError("train_loader is None while use_dummy_data is False")
+                for batch in train_loader:
+                    global_iter += 1
+                    batch = _to_device_batch(batch, device)
+                    metrics = train_step(model, optimizer, batch, cfg, global_iter, runtime)
+                    epoch_losses.append(metrics["total"])
+
+                    if global_iter == 1 or global_iter % cfg.log_every == 0:
+                        _log_train_step(global_iter, metrics)
+
+                    if cfg.save_every_steps > 0 and global_iter % cfg.save_every_steps == 0:
+                        _save_last_checkpoint(epoch=epoch, val_loss=float("nan"), val_metrics={}, reason="step_save", is_best=False)
+
+                    if _should_stop_now(stop_ctrl, cfg, global_iter):
+                        stop_this_epoch = True
+                        break
+
+            if stop_this_epoch:
+                print(f"[control] stop requested ({stop_ctrl.reason}). Saving and exiting.")
+                _save_last_checkpoint(epoch=epoch, val_loss=float("nan"), val_metrics={}, reason=stop_ctrl.reason, is_best=False)
+                save_train_state_json(
+                    output_dir=output_dir,
+                    run_id=cfg.run_id,
+                    epoch=epoch,
+                    global_iter=global_iter,
+                    best_val_loss=best_val_loss,
+                    patience_counter=patience_counter,
+                    status="stopped",
+                    reason=stop_ctrl.reason,
+                )
+                return best_metrics
+
+            scheduler.step()
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("inf")
+
+            val_loss, val_task_metrics, latent_all = validate_epoch(
+                model=model,
+                val_loader=val_loader,
+                cfg=cfg,
+                device=device,
+                runtime=runtime,
+            )
+            is_best = val_loss < best_val_loss
+
+            if is_best:
+                best_val_loss = val_loss
+                best_metrics = val_task_metrics.copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            _save_last_checkpoint(
+                epoch=epoch,
+                val_loss=val_loss,
+                val_metrics=val_task_metrics,
+                reason="epoch_end",
+                is_best=is_best,
+            )
+            tsne_path = maybe_visualize_epoch(latent_all, cfg, epoch)
+            _log_epoch(epoch, train_loss, val_loss, val_task_metrics, is_best, tsne_path)
+
+            if cfg.early_stop_patience > 0 and patience_counter >= cfg.early_stop_patience:
+                print(f"Early stopping at epoch {epoch} (patience={cfg.early_stop_patience})")
+                break
+
+        model.eval()
+        with torch.no_grad():
+            if cfg.use_dummy_data:
                 batch = make_dummy_batch(cfg, device)
-                metrics = train_step(model, optimizer, batch, cfg, global_iter)
-                epoch_losses.append(metrics["total"])
+            else:
+                if val_loader is None:
+                    raise RuntimeError("val_loader is None while use_dummy_data is False")
+                batch = _to_device_batch(next(iter(val_loader)), device)
+            out = model(batch["x"], lengths=batch.get("lengths"), sample_domain=False)
 
-                if global_iter == 1 or global_iter % cfg.log_every == 0:
-                    _log_train_step(global_iter, metrics)
-        else:
-            # Real data loop
-            for batch in train_loader:
-                global_iter += 1
-                batch = {k: v.to(device) for k, v in batch.items()}
-                metrics = train_step(model, optimizer, batch, cfg, global_iter)
-                epoch_losses.append(metrics["total"])
-
-                if global_iter == 1 or global_iter % cfg.log_every == 0:
-                    _log_train_step(global_iter, metrics)
-
-        scheduler.step()
-        train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("inf")
-
-        # ----- Validation -----
-        val_loss, val_task_metrics, latent_all = validate_epoch(
-            model, val_loader, cfg, device,
+        print(
+            f"Final shapes | recon={tuple(out['recon'].shape)} z_c={tuple(out['z_c'].shape)} "
+            f"z_d={tuple(out['z_d'].shape)} disease={tuple(out['disease_logits'].shape)} "
+            f"fall={tuple(out['fall_logits'].shape)} frailty={tuple(out['frailty_logits'].shape)}"
         )
-        is_best = val_loss < best_val_loss
-
-        if is_best:
-            best_val_loss = val_loss
-            best_metrics = val_task_metrics.copy()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        save_checkpoint(
-            state={
-                "epoch": epoch,
-                "global_iter": global_iter,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-                "val_metrics": val_task_metrics,
-                "config": cfg.__dict__,
-            },
-            is_best=is_best,
-            filename=str(output_dir / "last_model.pth"),
+        print(f"Best val metrics: {best_metrics}")
+        save_train_state_json(
+            output_dir=output_dir,
+            run_id=cfg.run_id,
+            epoch=current_epoch,
+            global_iter=global_iter,
+            best_val_loss=best_val_loss,
+            patience_counter=patience_counter,
+            status="completed",
+            reason="finished",
         )
+        return best_metrics
+    except KeyboardInterrupt:
+        stop_ctrl.request_stop("keyboard_interrupt")
+        print("[control] KeyboardInterrupt received. Saving checkpoint and exiting gracefully.")
+        _save_last_checkpoint(
+            epoch=max(current_epoch, 1),
+            val_loss=float("nan"),
+            val_metrics={},
+            reason=stop_ctrl.reason,
+            is_best=False,
+        )
+        save_train_state_json(
+            output_dir=output_dir,
+            run_id=cfg.run_id,
+            epoch=max(current_epoch, 1),
+            global_iter=global_iter,
+            best_val_loss=best_val_loss,
+            patience_counter=patience_counter,
+            status="stopped",
+            reason=stop_ctrl.reason,
+        )
+        return best_metrics
+    finally:
+        _restore_signal_handlers(previous_signal_handlers)
 
-        tsne_path = maybe_visualize_epoch(latent_all, cfg, epoch)
-        _log_epoch(epoch, train_loss, val_loss, val_task_metrics, is_best, tsne_path)
 
-        # Early stopping
-        if cfg.early_stop_patience > 0 and patience_counter >= cfg.early_stop_patience:
-            print(f"Early stopping at epoch {epoch} (patience={cfg.early_stop_patience})")
-            break
-
-    # ----- Final eval -----
-    model.eval()
-    with torch.no_grad():
-        if cfg.use_dummy_data:
-            batch = make_dummy_batch(cfg, device)
-        else:
-            batch = next(iter(val_loader))
-            batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(batch["x"], lengths=batch.get("lengths"), sample_domain=False)
-    print(
-        f"Final shapes | recon={tuple(out['recon'].shape)} z_c={tuple(out['z_c'].shape)} "
-        f"z_d={tuple(out['z_d'].shape)} disease={tuple(out['disease_logits'].shape)} "
-        f"fall={tuple(out['fall_logits'].shape)} frailty={tuple(out['frailty_logits'].shape)}"
-    )
-    print(f"Best val metrics: {best_metrics}")
-    return best_metrics
+def train(cfg: TrainConfig) -> dict[str, float]:
+    """Train entry with optional OOM auto-batch retry."""
+    current_batch = cfg.batch_size
+    while True:
+        attempt_cfg = copy.deepcopy(cfg)
+        attempt_cfg.batch_size = current_batch
+        try:
+            return _train_once(attempt_cfg)
+        except RuntimeError as exc:
+            if not cfg.auto_batch or not _is_oom_exception(exc):
+                raise
+            next_batch = max(cfg.min_batch_size, current_batch // 2)
+            if next_batch >= current_batch:
+                raise
+            print(
+                f"[auto-batch] CUDA OOM at batch_size={current_batch}; "
+                f"retrying with batch_size={next_batch}"
+            )
+            current_batch = next_batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _log_train_step(global_iter: int, m: dict[str, float]) -> None:
+    amp_flag = "amp=on" if m.get("amp_enabled", 0.0) > 0.5 else "amp=off"
     print(
         f"iter {global_iter:05d} | total={m['total']:.4f} recon={m['recon']:.4f} "
         f"cls={m['cls']:.4f} irm={m['irm']:.4f} dag={m['dag']:.4f} "
         f"hsic={m['hsic']:.4f} mt={m['mt']:.4f} cf={m['cf_cls']:.4f} "
-        f"beta3={m['beta3']:.3f}"
+        f"beta3={m['beta3']:.3f} {amp_flag}"
     )
 
 
@@ -655,7 +1139,27 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--use-dummy-data", action="store_true")
     parser.add_argument("--early-stop-patience", type=int, default=15)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+
+    parser.add_argument("--pin-memory", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--persistent-workers", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+
+    parser.add_argument("--auto-batch", action="store_true")
+    parser.add_argument("--min-batch-size", type=int, default=4)
+
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--run-id", default="default")
+    parser.add_argument("--control-dir", default="outputs/control")
+    parser.add_argument("--check-stop-every", type=int, default=20)
+    parser.add_argument("--save-every-steps", type=int, default=200)
+
+    parser.add_argument("--use-amp", type=_str2bool, nargs="?", const=True, default=None)
+    parser.add_argument("--amp-dtype", default="fp16", choices=["fp16", "bf16"])
+    parser.add_argument("--allow-tf32", type=_str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--cudnn-benchmark", type=_str2bool, nargs="?", const=True, default=True)
+
     # Ablation flags
     parser.add_argument("--no-scm", action="store_true")
     parser.add_argument("--no-irm", action="store_true")
@@ -681,6 +1185,21 @@ def parse_args() -> TrainConfig:
         use_dummy_data=args.use_dummy_data,
         early_stop_patience=args.early_stop_patience,
         num_workers=args.num_workers,
+        device=args.device,
+        pin_memory=bool(args.pin_memory),
+        persistent_workers=bool(args.persistent_workers),
+        prefetch_factor=args.prefetch_factor,
+        auto_batch=args.auto_batch,
+        min_batch_size=args.min_batch_size,
+        resume_from=args.resume_from,
+        run_id=args.run_id,
+        control_dir=args.control_dir,
+        check_stop_every=args.check_stop_every,
+        save_every_steps=args.save_every_steps,
+        use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        allow_tf32=bool(args.allow_tf32),
+        cudnn_benchmark=bool(args.cudnn_benchmark),
         use_scm=not args.no_scm,
         use_irm=not args.no_irm,
         use_counterfactual=not args.no_counterfactual,
