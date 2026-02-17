@@ -1,9 +1,11 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$PythonExe = ".venv\Scripts\python.exe",
     [string]$RunId = "",
     [string]$OutputRoot = "outputs",
     [string]$ControlDir = "outputs/control",
     [string]$Profile = "local_4060_full",
+    [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs = @()
 )
 
@@ -49,7 +51,8 @@ $argList = @(
     "--persistent-workers", "false",
     "--prefetch-factor", "2",
     "--check-stop-every", "20",
-    "--save-every-steps", "200"
+    "--save-every-steps", "200",
+    "--pipeline-autosave-sec", "3600"
 ) + $ExtraArgs
 
 $proc = Start-Process `

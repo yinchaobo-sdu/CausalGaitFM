@@ -370,6 +370,7 @@ def main() -> None:
     parser.add_argument("--progress-interval-sec", type=float, default=2.0)
     parser.add_argument("--disable-progress-eta", action="store_true")
     parser.add_argument("--progress-file", default=None)
+    parser.add_argument("--pipeline-autosave-sec", type=int, default=3600)
 
     parser.add_argument("--run-id", default="default")
     parser.add_argument("--control-dir", default="outputs/control")
@@ -399,6 +400,11 @@ def main() -> None:
 
     parser.add_argument("--check-stop-every", type=int, default=20)
     parser.add_argument("--save-every-steps", type=int, default=200)
+    parser.add_argument(
+        "--single-task-resume-from",
+        default=None,
+        help="Optional checkpoint path used only for single_task/multi_task resume.",
+    )
 
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-preprocess", action="store_true")
@@ -406,6 +412,13 @@ def main() -> None:
     parser.add_argument("--skip-benchmark", action="store_true")
     parser.add_argument("--skip-paper", action="store_true")
     args = parser.parse_args()
+
+    if args.single_task_resume_from:
+        resume_path = Path(args.single_task_resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"--single-task-resume-from not found: {resume_path}"
+            )
 
     profile = PROFILES[args.profile]
     resolved_device = _resolve_device(args.device)
@@ -417,6 +430,8 @@ def main() -> None:
     state = _normalize_state(state=state, run_id=args.run_id)
     state["status"] = "running"
     state["last_error"] = None
+    state.pop("failed_stage", None)
+    state.pop("stopped_stage", None)
     if not args.resume:
         state["started_at"] = int(time.time())
         state["completed_stages"] = []
@@ -445,6 +460,12 @@ def main() -> None:
         last_save_ts = now
 
     base_cfg = _make_base_config(profile=profile, args=args, resolved_device=resolved_device)
+    base_cfg.pipeline_progress_file = str(progress_path)
+    base_cfg.pipeline_autosave_sec = max(0, int(args.pipeline_autosave_sec))
+    print(
+        f"[pipeline] autosave during training: every {base_cfg.pipeline_autosave_sec}s "
+        f"to {base_cfg.pipeline_progress_file}"
+    )
 
     def make_stage_progress_cb(stage_name: str) -> Callable[[dict[str, Any]], None]:
         def _cb(event: dict[str, Any]) -> None:
@@ -473,6 +494,8 @@ def main() -> None:
         _set_current_stage(state, stage_name)
         state["status"] = "running"
         state["last_error"] = None
+        state.pop("failed_stage", None)
+        state.pop("stopped_stage", None)
         persist_state(force=True)
         print(f"[pipeline] running stage '{stage_name}'")
 
@@ -587,7 +610,11 @@ def main() -> None:
 
         progress_cb = make_stage_progress_cb("single_task")
         _run_with_auto_batch(
-            fn=lambda cfg: run_single_task(cfg, progress_cb=progress_cb),
+            fn=lambda cfg: run_single_task(
+                cfg,
+                progress_cb=progress_cb,
+                multi_task_resume_from=args.single_task_resume_from,
+            ),
             cfg=base_cfg,
             auto_batch=args.auto_batch,
             min_batch_size=args.min_batch_size,

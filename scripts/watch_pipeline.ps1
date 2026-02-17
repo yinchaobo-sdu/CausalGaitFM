@@ -90,13 +90,21 @@ while ($true) {
     }
 
     if ($ShowLog) {
-        $logPath = $primaryLogPath
-        if (-not (Test-Path $logPath) -and (Test-Path $resumeLogPath)) {
-            $logPath = $resumeLogPath
+        $logCandidates = @()
+        if (Test-Path $primaryLogPath) {
+            $logCandidates += Get-Item $primaryLogPath
+        }
+        if (Test-Path $resumeLogPath) {
+            $logCandidates += Get-Item $resumeLogPath
+        }
+
+        $logPath = $null
+        if ($logCandidates.Count -gt 0) {
+            $logPath = ($logCandidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
         }
         Write-Host ""
         Write-Host ("log_tail ({0})" -f $logPath)
-        if (Test-Path $logPath) {
+        if ($null -ne $logPath -and (Test-Path $logPath)) {
             Get-Content $logPath -Tail $LogLines
         } else {
             Write-Host "log_not_found"

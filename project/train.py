@@ -93,6 +93,8 @@ class TrainConfig:
     control_dir: str = "outputs/control"
     check_stop_every: int = 20
     save_every_steps: int = 200
+    pipeline_progress_file: str | None = None
+    pipeline_autosave_sec: int = 0
 
     # AMP and CUDA runtime
     use_amp: bool | None = None  # None => auto (enabled on CUDA)
@@ -288,14 +290,63 @@ def _capture_rng_state() -> dict[str, Any]:
 def _restore_rng_state(state: dict[str, Any]) -> None:
     if not state:
         return
-    if "python" in state:
-        random.setstate(state["python"])
-    if "numpy" in state:
-        np.random.set_state(state["numpy"])
-    if "torch" in state:
-        torch.set_rng_state(state["torch"])
+
+    def _to_byte_tensor(value: Any) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().to(dtype=torch.uint8)
+        if isinstance(value, np.ndarray):
+            return torch.tensor(value, dtype=torch.uint8)
+        if isinstance(value, (list, tuple)):
+            try:
+                return torch.tensor(value, dtype=torch.uint8)
+            except Exception:
+                return None
+        return None
+
+    try:
+        if "python" in state:
+            random.setstate(state["python"])
+    except Exception as exc:
+        print(f"[warn] Failed to restore python RNG state: {type(exc).__name__}: {exc}")
+
+    try:
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+    except Exception as exc:
+        print(f"[warn] Failed to restore numpy RNG state: {type(exc).__name__}: {exc}")
+
+    try:
+        if "torch" in state:
+            torch_state = _to_byte_tensor(state["torch"])
+            if torch_state is not None:
+                torch.set_rng_state(torch_state)
+            else:
+                print("[warn] Skipping torch RNG restore: unsupported checkpoint RNG format.")
+    except Exception as exc:
+        print(f"[warn] Failed to restore torch RNG state: {type(exc).__name__}: {exc}")
+
     if torch.cuda.is_available() and state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        try:
+            cuda_state_raw = state["cuda"]
+            cuda_states: list[torch.Tensor] = []
+            if isinstance(cuda_state_raw, (list, tuple)):
+                for item in cuda_state_raw:
+                    item_tensor = _to_byte_tensor(item)
+                    if item_tensor is not None:
+                        cuda_states.append(item_tensor)
+            else:
+                item_tensor = _to_byte_tensor(cuda_state_raw)
+                if item_tensor is not None:
+                    cuda_states.append(item_tensor)
+
+            if cuda_states:
+                torch.cuda.set_rng_state_all(cuda_states)
+            else:
+                print("[warn] Skipping CUDA RNG restore: unsupported checkpoint RNG format.")
+        except Exception as exc:
+            print(f"[warn] Failed to restore CUDA RNG state: {type(exc).__name__}: {exc}")
 
 
 def _to_device_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
@@ -588,6 +639,23 @@ def _cat_batches(batches: list[Tensor]) -> Tensor:
     return torch.cat(batches, dim=0)
 
 
+def _empty_task_metrics() -> dict[str, float]:
+    return {
+        "disease_acc": 0.0,
+        "disease_macro_f1": 0.0,
+        "disease_auc": 0.0,
+        "fall_acc": 0.0,
+        "fall_macro_f1": 0.0,
+        "fall_auc": 0.0,
+        "fall_ordinal_acc": 0.0,
+        "frailty_acc": 0.0,
+        "frailty_macro_f1": 0.0,
+        "frailty_auc": 0.0,
+        "frailty_ordinal_acc": 0.0,
+        "frailty_mae": 0.0,
+    }
+
+
 def validate_epoch(
     model: CausalGaitModel,
     val_loader: DataLoader | None,
@@ -623,6 +691,16 @@ def validate_epoch(
                 y_pred_store[key].append(y_pred[key])
             for key in latent_store:
                 latent_store[key].append(latent[key])
+
+    if len(val_losses) == 0:
+        print("[warn] Validation set is empty; returning default validation metrics.")
+        latent_all = {
+            "z_c": torch.empty((0, cfg.causal_dim), dtype=torch.float32),
+            "z_d": torch.empty((0, cfg.domain_dim), dtype=torch.float32),
+            "domain_id": torch.empty((0,), dtype=torch.long),
+            "disease_label": torch.empty((0,), dtype=torch.long),
+        }
+        return float("inf"), _empty_task_metrics(), latent_all
 
     y_true_all = {k: _cat_batches(v) for k, v in y_true_store.items()}
     y_pred_all = {k: _cat_batches(v) for k, v in y_pred_store.items()}
@@ -702,6 +780,58 @@ def save_train_state_json(
     return path
 
 
+def maybe_autosave_pipeline_state(
+    cfg: TrainConfig,
+    epoch: int,
+    global_iter: int,
+    last_autosave_ts: float,
+) -> float:
+    interval_sec = int(cfg.pipeline_autosave_sec)
+    progress_file = cfg.pipeline_progress_file
+    if interval_sec <= 0 or not progress_file:
+        return last_autosave_ts
+
+    now = time.time()
+    if last_autosave_ts > 0.0 and (now - last_autosave_ts) < interval_sec:
+        return last_autosave_ts
+
+    progress_path = Path(progress_file)
+    try:
+        state: dict[str, Any] = {}
+        if progress_path.exists():
+            with open(progress_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state = loaded
+
+        heartbeat = state.get("train_heartbeat")
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        heartbeat.update(
+            {
+                "epoch": int(epoch),
+                "global_iter": int(global_iter),
+                "output_dir": str(cfg.output_dir),
+                "timestamp": int(now),
+            }
+        )
+
+        state["train_heartbeat"] = heartbeat
+        state["updated_at"] = int(now)
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+        print(
+            f"[pipeline] autosave heartbeat written "
+            f"(epoch={epoch}, iter={global_iter}, interval_sec={interval_sec})"
+        )
+        return now
+    except Exception as exc:
+        print(f"[warn] pipeline autosave skipped: {type(exc).__name__}: {exc}")
+        return last_autosave_ts
+
+
 def maybe_visualize_epoch(
     latent_all: dict[str, Tensor],
     cfg: TrainConfig,
@@ -716,6 +846,10 @@ def maybe_visualize_epoch(
     z_d = latent_all["z_d"]
     domain_id = latent_all["domain_id"]
     disease_label = latent_all["disease_label"]
+
+    if z_c.size(0) < 2 or z_d.size(0) < 2:
+        print("[warn] t-SNE skipped: not enough validation points.")
+        return None
 
     if cfg.tsne_max_points > 0 and z_c.size(0) > cfg.tsne_max_points:
         keep_idx = torch.randperm(z_c.size(0))[: cfg.tsne_max_points]
@@ -926,6 +1060,7 @@ def _train_once(cfg: TrainConfig) -> dict[str, float]:
         return best_metrics
 
     current_epoch = start_epoch - 1
+    last_pipeline_autosave_ts = 0.0
     try:
         for epoch in range(start_epoch, cfg.num_epochs + 1):
             current_epoch = epoch
@@ -946,6 +1081,13 @@ def _train_once(cfg: TrainConfig) -> dict[str, float]:
                     if cfg.save_every_steps > 0 and global_iter % cfg.save_every_steps == 0:
                         _save_last_checkpoint(epoch=epoch, val_loss=float("nan"), val_metrics={}, reason="step_save", is_best=False)
 
+                    last_pipeline_autosave_ts = maybe_autosave_pipeline_state(
+                        cfg=cfg,
+                        epoch=epoch,
+                        global_iter=global_iter,
+                        last_autosave_ts=last_pipeline_autosave_ts,
+                    )
+
                     if _should_stop_now(stop_ctrl, cfg, global_iter):
                         stop_this_epoch = True
                         break
@@ -963,6 +1105,13 @@ def _train_once(cfg: TrainConfig) -> dict[str, float]:
 
                     if cfg.save_every_steps > 0 and global_iter % cfg.save_every_steps == 0:
                         _save_last_checkpoint(epoch=epoch, val_loss=float("nan"), val_metrics={}, reason="step_save", is_best=False)
+
+                    last_pipeline_autosave_ts = maybe_autosave_pipeline_state(
+                        cfg=cfg,
+                        epoch=epoch,
+                        global_iter=global_iter,
+                        last_autosave_ts=last_pipeline_autosave_ts,
+                    )
 
                     if _should_stop_now(stop_ctrl, cfg, global_iter):
                         stop_this_epoch = True
@@ -1008,6 +1157,12 @@ def _train_once(cfg: TrainConfig) -> dict[str, float]:
                 val_metrics=val_task_metrics,
                 reason="epoch_end",
                 is_best=is_best,
+            )
+            last_pipeline_autosave_ts = maybe_autosave_pipeline_state(
+                cfg=cfg,
+                epoch=epoch,
+                global_iter=global_iter,
+                last_autosave_ts=last_pipeline_autosave_ts,
             )
             tsne_path = maybe_visualize_epoch(latent_all, cfg, epoch)
             _log_epoch(epoch, train_loss, val_loss, val_task_metrics, is_best, tsne_path)
@@ -1154,6 +1309,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--control-dir", default="outputs/control")
     parser.add_argument("--check-stop-every", type=int, default=20)
     parser.add_argument("--save-every-steps", type=int, default=200)
+    parser.add_argument("--pipeline-progress-file", default=None)
+    parser.add_argument("--pipeline-autosave-sec", type=int, default=0)
 
     parser.add_argument("--use-amp", type=_str2bool, nargs="?", const=True, default=None)
     parser.add_argument("--amp-dtype", default="fp16", choices=["fp16", "bf16"])
@@ -1196,6 +1353,8 @@ def parse_args() -> TrainConfig:
         control_dir=args.control_dir,
         check_stop_every=args.check_stop_every,
         save_every_steps=args.save_every_steps,
+        pipeline_progress_file=args.pipeline_progress_file,
+        pipeline_autosave_sec=args.pipeline_autosave_sec,
         use_amp=args.use_amp,
         amp_dtype=args.amp_dtype,
         allow_tf32=bool(args.allow_tf32),

@@ -25,28 +25,28 @@ if (-not [int]::TryParse($pidRaw, [ref]$null)) {
     Write-Warning "Invalid PID value in ${pidPath}: '$pidRaw'"
     exit 0
 }
-$pid = [int]$pidRaw
+$runPid = [int]$pidRaw
 
-$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+$proc = Get-Process -Id $runPid -ErrorAction SilentlyContinue
 if ($null -eq $proc) {
-    Write-Host "Process already exited: $pid"
+    Write-Host "Process already exited: $runPid"
     exit 0
 }
 
-Write-Host "waiting_for_pid=$pid timeout=${TimeoutSeconds}s"
+Write-Host "waiting_for_pid=$runPid timeout=${TimeoutSeconds}s"
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while ((Get-Date) -lt $deadline) {
-    $alive = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $alive = Get-Process -Id $runPid -ErrorAction SilentlyContinue
     if ($null -eq $alive) {
-        Write-Host "process_exited=$pid"
+        Write-Host "process_exited=$runPid"
         exit 0
     }
     Start-Sleep -Seconds 2
 }
 
 if ($Force) {
-    Write-Warning "Timeout reached. Force-killing PID $pid"
-    Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    Write-Warning "Timeout reached. Force-killing PID $runPid"
+    Stop-Process -Id $runPid -Force -ErrorAction SilentlyContinue
     exit 0
 }
 

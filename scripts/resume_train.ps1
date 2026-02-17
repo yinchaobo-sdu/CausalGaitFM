@@ -1,9 +1,11 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)]
     [string]$RunId,
     [string]$PythonExe = ".venv\Scripts\python.exe",
     [string]$OutputRoot = "outputs",
     [string]$ControlDir = "outputs/control",
+    [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs = @()
 )
 

@@ -92,6 +92,41 @@ def _emit_progress(
     )
 
 
+def _empty_task_metrics(skipped: bool = False) -> dict[str, float]:
+    metrics = {
+        "disease_acc": 0.0,
+        "disease_macro_f1": 0.0,
+        "disease_auc": 0.0,
+        "fall_acc": 0.0,
+        "fall_macro_f1": 0.0,
+        "fall_auc": 0.0,
+        "fall_ordinal_acc": 0.0,
+        "frailty_acc": 0.0,
+        "frailty_macro_f1": 0.0,
+        "frailty_auc": 0.0,
+        "frailty_ordinal_acc": 0.0,
+        "frailty_mae": 0.0,
+    }
+    if skipped:
+        metrics["skipped"] = 1.0
+    return metrics
+
+
+def _domain_sample_count(processed_dir: str, domain_name: str) -> int:
+    npz_path = Path(processed_dir) / f"{domain_name.lower()}.npz"
+    if not npz_path.exists():
+        return 0
+    try:
+        with np.load(npz_path) as data:
+            if "X" in data:
+                return int(data["X"].shape[0])
+            if "y" in data:
+                return int(data["y"].shape[0])
+    except Exception as exc:
+        print(f"[warn] failed to inspect {npz_path}: {type(exc).__name__}: {exc}")
+    return 0
+
+
 # ============================================================================
 # Experiment: CausalGaitFM Cross-Domain (paper Table 2, last row)
 # ============================================================================
@@ -104,12 +139,29 @@ def run_cross_domain(
     all_domains = base_cfg.dataset_names
     total = len(all_domains)
     results = {}
+    domain_counts = {
+        name: _domain_sample_count(base_cfg.processed_dir, name)
+        for name in all_domains
+    }
     _emit_progress(progress_cb, "cross_domain", "start", 0, total, "")
 
     for target in all_domains:
         if _stop_requested(base_cfg):
             print("[control] stop requested; terminating cross-domain loop.")
             break
+
+        target_count = domain_counts.get(target, 0)
+        source_count = sum(v for k, v in domain_counts.items() if k != target)
+        if target_count <= 0:
+            print(f"[warn] Cross-domain target={target} has 0 samples. Skipping this target.")
+            results[target] = _empty_task_metrics(skipped=True)
+            _emit_progress(progress_cb, "cross_domain", "step_done", len(results), total, target)
+            continue
+        if source_count <= 0:
+            print(f"[warn] Cross-domain source data is empty when target={target}. Skipping this target.")
+            results[target] = _empty_task_metrics(skipped=True)
+            _emit_progress(progress_cb, "cross_domain", "step_done", len(results), total, target)
+            continue
 
         print(f"\n{'='*60}")
         print(f"Cross-domain: target={target}")
@@ -131,11 +183,15 @@ def run_cross_domain(
     print(f"\n{'='*60}")
     print("Cross-domain results summary:")
     for target, m in results.items():
+        if m.get("skipped", 0.0) > 0.5:
+            print(f"  {target}: skipped (empty target/source domain)")
+            continue
         acc = m.get("disease_acc", 0) * 100
         print(f"  {target}: disease_acc={acc:.1f}%")
 
-    if results:
-        avg_acc = np.mean([m.get("disease_acc", 0) for m in results.values()]) * 100
+    valid_metrics = [m for m in results.values() if m.get("skipped", 0.0) <= 0.5]
+    if valid_metrics:
+        avg_acc = np.mean([m.get("disease_acc", 0) for m in valid_metrics]) * 100
         print(f"  Average: {avg_acc:.1f}%")
     else:
         print("  No completed targets.")
@@ -447,6 +503,7 @@ def run_in_domain(
 def run_single_task(
     base_cfg: TrainConfig,
     progress_cb: ProgressCallback | None = None,
+    multi_task_resume_from: str | None = None,
 ) -> dict[str, dict[str, float]]:
     """Compare single-task training vs multi-task training (paper Table 4).
 
@@ -465,6 +522,9 @@ def run_single_task(
     cfg_mt = deepcopy(base_cfg)
     cfg_mt.single_task = None
     cfg_mt.output_dir = f"{base_cfg.output_dir}/single_task/multi_task"
+    if multi_task_resume_from:
+        cfg_mt.resume_from = multi_task_resume_from
+        print(f"[single_task] multi_task resume_from={multi_task_resume_from}")
     results["multi_task"] = train(cfg_mt)
     done += 1
     _emit_progress(progress_cb, "single_task", "step_done", done, total, "multi_task")
